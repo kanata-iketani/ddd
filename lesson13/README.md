@@ -1,14 +1,30 @@
 # 第13章 アーキテクチャパターン（ヘキサゴナル・オニオン・クリーン）
 
-戦術パターンで作ったドメインモデルを、DB やフレームワークの都合から守るのがアーキテクチャの仕事です。この章ではヘキサゴナル・オニオン・クリーンという 3 つの有名パターンの「共通する本質」をつかみ、Go / Python の現実的なプロジェクト構成に落とします。
+戦術パターンで作ったドメインモデルを、DB やフレームワークの都合から守るのがアーキテクチャの仕事です。この章ではヘキサゴナル・オニオン・クリーンという 3 つの有名パターンの「共通する本質」をつかみ、Go / Python の現実的なプロジェクト構成に落とします。L11 のリポジトリと interface、L12 のアプリケーションサービスとレイヤーを使うので、あやふやなら先に見直してください。
 
 ## 1. 依存性逆転とヘキサゴナルアーキテクチャ
 
+### 基礎の基礎: 「依存する」とは
+
+コードの世界で「A が B に**依存する**」とは、A が B を import したり呼び出したりしていて、**B が変わると A も直す必要が出る**関係のことです。
+
+| 書き方 | 依存の向き |
+|---|---|
+| 注文のコードが `database/sql`(Go 標準の DB 接続パッケージ)を import する | 注文 → DB |
+| 注文のコードが HTTP クライアント(外部の Web サービスを呼ぶ部品)を使う | 注文 → 外部サービス |
+
+この講座でいう**外界**は、DB・外部サービス・Web フレームワーク・画面など、ドメインの外側にあるものすべてです。
+
 ### 依存の向きがドメインを壊す
 
-素朴に書くと、ドメインロジックが `database/sql` や HTTP クライアントを直接 import しがちです。こうなると DB の都合(スキーマ変更、接続方法)がビジネスルールのコードに波及し、テストにも実 DB が必要になります。
+素朴に書くと、ドメインロジックが `database/sql` や HTTP クライアントを直接 import しがちです。こうなると DB の都合(スキーマ=テーブルの列の構成の変更、接続方法)がビジネスルールのコードに波及し、テストにも実 DB が必要になります。
 
-これを断ち切るのが**依存性逆転の原則 (Dependency Inversion Principle, DIP)** です。「具象(DB 実装)ではなく抽象(interface)に依存せよ」。Go では **interface を使う側(ドメイン・ユースケース側)で定義する**のが慣例で、DIP と相性抜群です。
+これを断ち切るのが**依存性逆転の原則 (Dependency Inversion Principle, DIP)** です。「具象(DB 実装)ではなく抽象(interface)に依存せよ」。
+
+- **具象**: 実際に動く中身を持つ実装。例: PostgreSQL(よく使われる DB 製品)に SQL を投げて保存するコード
+- **抽象**: 中身を持たず「何ができるか」だけを決めたもの。Go では **interface**(L11 で見た、メソッドの一覧だけを決めた型)
+
+Go では **interface を使う側(ドメイン・ユースケース側)で定義する**のが慣例で、DIP と相性抜群です。
 
 ```go
 // domain/order.go — ドメイン側が「欲しい能力」を interface で宣言する(=ポート)
@@ -22,9 +38,135 @@ type OrderRepo struct{ db *sql.DB }
 func (r *OrderRepo) Save(ctx context.Context, o *domain.Order) error { /* SQL */ }
 ```
 
+| 部分 | 意味 |
+|---|---|
+| `type OrderRepository interface { ... }` | 「Save と FindByID を持つもの」という型を決める。中身(どう保存するか)は書かない |
+| `ctx context.Context` | 処理の中断や時間切れを伝えるための、Go で慣例的に第1引数に置く値。いまは読み飛ばしてかまいません |
+| `Save(...) error` | 保存して、失敗したら error を返す(成功なら nil) |
+| `FindByID(...) (*Order, error)` | ID で探して、見つかった注文へのポインタと error の2つを返す(L4 で見た多値返し) |
+| `type OrderRepo struct{ db *sql.DB }` | 外側の実装。中に DB 接続 `*sql.DB` を持つ |
+| `func (r *OrderRepo) Save(...)` | OrderRepo に Save メソッドを付ける。`domain.Order` は「domain パッケージの Order」 |
+| `/* SQL */` | 本当はここに INSERT 文などを書く(省略) |
+
+Go では「この型は OrderRepository を実装します」と宣言する必要がありません。**interface に書かれたメソッドを全部持っている型は、自動的にその interface として使えます**。OrderRepo が Save と FindByID を持てば、OrderRepository として渡せます。
+
+### なぜ「逆転」と呼ぶのか
+
+| | ドメインのコードが import するもの | 依存の向き |
+|---|---|---|
+| 素朴な書き方 | `database/sql` | ドメイン → DB |
+| DIP を使う | 何も import しない(interface は自分で定義) | ドメイン ← DB 実装(アダプタがドメインの interface に合わせる) |
+
+DB の実装側が、ドメインの決めた interface に合わせにいく形になります。矢印の向きが素朴な書き方と逆になるので「逆転」です。
+
+### 動かして確かめる
+
+DB を用意しなくても動くように、通知(メール/チャット)を例にした完全版です。
+
+```go
+package main
+
+import "fmt"
+
+// ===== 内側: ユースケースが「欲しい能力」を宣言する(ポート) =====
+type Notifier interface {
+	Notify(to string, msg string) error
+}
+
+// 内側の処理は Notifier という interface しか知らない
+func ConfirmOrder(n Notifier, orderID string) error {
+	// (ここで注文を確定する処理をしたとして)
+	return n.Notify("buyer@example.com", "注文 "+orderID+" を確定しました")
+}
+
+// ===== 外側: ポートを実装するアダプタ =====
+type EmailNotifier struct{}
+
+func (e EmailNotifier) Notify(to string, msg string) error {
+	fmt.Println("[メール]", to, "宛:", msg)
+	return nil
+}
+
+type ChatNotifier struct {
+	Channel string
+}
+
+func (c ChatNotifier) Notify(to string, msg string) error {
+	fmt.Println("[チャット]", c.Channel, ":", msg)
+	return nil
+}
+
+func main() {
+	ConfirmOrder(EmailNotifier{}, "o-001")
+	ConfirmOrder(ChatNotifier{Channel: "#orders"}, "o-002")
+}
+```
+
+実行結果:
+
+```text
+[メール] buyer@example.com 宛: 注文 o-001 を確定しました
+[チャット] #orders : 注文 o-002 を確定しました
+```
+
+| 部分 | 意味 |
+|---|---|
+| `type Notifier interface { Notify(...) error }` | ポート。「Notify できるもの」という型 |
+| `func ConfirmOrder(n Notifier, ...)` | 引数は interface。メールかチャットかを知らない |
+| `type EmailNotifier struct{}` | 中身(フィールド)を持たない struct。メソッドだけを持たせるために使う |
+| `func (e EmailNotifier) Notify(...)` | Notify を持つので、EmailNotifier は自動的に Notifier として使える |
+| `ConfirmOrder(EmailNotifier{}, "o-001")` | メールのアダプタを渡す。ConfirmOrder の中身は1行も変えずに… |
+| `ConfirmOrder(ChatNotifier{...}, "o-002")` | …チャットのアダプタに差し替えられる |
+
+メソッドが足りない型を渡すと、実行する前にコンパイル(Go がプログラムを機械語に変換する段階)で止まります。`Notify` ではなく `Send` しか持たない `FaxNotifier` を渡したときのエラーです。
+
+```text
+./main.go:17:15: cannot use FaxNotifier{} (value of type FaxNotifier) as Notifier value in argument to ConfirmOrder: FaxNotifier does not implement Notifier (missing method Notify)
+```
+
+「FaxNotifier は Notifier を実装していない(Notify メソッドがない)」という意味です。
+
+Python では `typing.Protocol` で同じ形を書けます。
+
+```python
+from typing import Protocol
+
+
+# 内側: 欲しい能力を宣言する(ポート)
+class Notifier(Protocol):
+    def notify(self, to: str, msg: str) -> None: ...
+
+
+def confirm_order(n: Notifier, order_id: str) -> None:
+    n.notify("buyer@example.com", f"注文 {order_id} を確定しました")
+
+
+# 外側: アダプタ
+class EmailNotifier:
+    def notify(self, to: str, msg: str) -> None:
+        print("[メール]", to, "宛:", msg)
+
+
+class ChatNotifier:
+    def __init__(self, channel: str):
+        self.channel = channel
+
+    def notify(self, to: str, msg: str) -> None:
+        print("[チャット]", self.channel, ":", msg)
+
+
+confirm_order(EmailNotifier(), "o-001")
+confirm_order(ChatNotifier("#orders"), "o-002")
+```
+
+```text
+[メール] buyer@example.com 宛: 注文 o-001 を確定しました
+[チャット] #orders : 注文 o-002 を確定しました
+```
+
 ### ヘキサゴナル(ポート&アダプタ)
 
-**ヘキサゴナルアーキテクチャ (Hexagonal Architecture)** は、この考えをシステム全体に広げたものです。
+**ヘキサゴナルアーキテクチャ (Hexagonal Architecture)** は、この考えをシステム全体に広げたものです。中心(ドメイン+ユースケース)を六角形で描き、その周りに外界とつなぐ部品を並べた図から、この名前が付きました。
 
 | 用語 | 意味 | 例 |
 |---|---|---|
@@ -33,7 +175,23 @@ func (r *OrderRepo) Save(ctx context.Context, o *domain.Order) error { /* SQL */
 | プライマリアダプタ | アプリを**駆動する**側 | HTTP ハンドラ、CLI、cron |
 | セカンダリアダプタ | アプリに**駆動される**側 | DB、メール送信、外部 API |
 
-内側(ドメイン+ユースケース)は外界を一切知らず、外界の交換(Postgres→DynamoDB、メール→Slack)はアダプタの差し替えだけで済みます。
+- **HTTP ハンドラ**: ブラウザなどから届いたリクエストを受け取り、処理を呼ぶ関数
+- **CLI**: ターミナルで打つコマンドとして動かす入口
+- **cron**: 「毎日3時に実行」のように決まった時刻に処理を起動する仕組み
+- **駆動する側**: 外から処理を呼び出して動かし始める側。**駆動される側**: 中の処理から呼ばれて仕事をする側
+
+ECサイトで「注文する」ボタンが押されたときの流れに当てはめると、次のようになります。
+
+| 順 | 部品 | 種類 |
+|---|---|---|
+| 1 | HTTP ハンドラがリクエストを受ける | プライマリアダプタ |
+| 2 | 注文のユースケースと Order がルールを確認する | 内側 |
+| 3 | `OrderRepository` 経由で DB に保存する | ポート → セカンダリアダプタ |
+| 4 | `Notifier` 経由で確認メールを送る | ポート → セカンダリアダプタ |
+
+内側(ドメイン+ユースケース)は外界を一切知らず、外界の交換(Postgres→DynamoDB(AWS の DB サービス)、メール→Slack(チャットツール))はアダプタの差し替えだけで済みます。
+
+なお、SQL を DB の中に保存しておく**ストアドプロシージャ**に移す方法もありますが、ビジネスルールが DB の中に入るだけで、ドメインから外界への依存は消えません。
 
 💡 コツ: 「import の矢印が常に内側(ドメイン)へ向いているか」だけをレビューで見れば、このアーキテクチャは守れます。
 
@@ -114,16 +272,38 @@ Go の慣例「interface は使う側で定義する」は DIP そのもので�
 
 </details>
 
+**問6.** この章の完全版で、`Notify` メソッドを持たず `Send` メソッドだけを持つ `FaxNotifier` を `ConfirmOrder(FaxNotifier{}, "o-003")` のように渡しました。Go ではどうなるでしょう?
+
+1. 実行はされるが、Notify の部分だけ何もせずに終わる
+2. コンパイルの段階でエラーになり、プログラムは実行されない
+3. Go が名前の近い Send メソッドを自動で代わりに呼ぶ
+4. 実行時に初めてエラーになり、途中まで処理が進んでから止まる
+
+<details><summary>答えと解説</summary>
+
+正解: **2**
+
+Go の interface は「書かれたメソッドを全部持っている型だけが、その interface として使える」というルールです。FaxNotifier には Notify がないので、`FaxNotifier does not implement Notifier (missing method Notify)` というコンパイルエラーになり、実行まで進みません。何もせずに終わることはなく、名前が近いメソッドを代わりに呼ぶ仕組みもありません。実行時ではなくコンパイル時に見つかるので、アダプタを差し替えたときの書き漏れにすぐ気づけます。
+
+</details>
+
 ## 2. オニオン・クリーンアーキテクチャ — 共通する本質
 
 ### 同心円の仲間たち
 
-ヘキサゴナルの後に提案された **オニオンアーキテクチャ (Onion Architecture)** と **クリーンアーキテクチャ (Clean Architecture)** は、どちらも同心円で層を描きます。
+ヘキサゴナル(ch01)の後に提案された **オニオンアーキテクチャ (Onion Architecture)** と **クリーンアーキテクチャ (Clean Architecture)** は、どちらも同心円(中心が同じ複数の円)で層を描きます。**層(レイヤー)** は L12 で見たとおり、役割ごとにコードを分けたまとまりです。
 
 | | 中心 | その外 | さらに外 | 最外殻 |
 |---|---|---|---|---|
 | オニオン | ドメインモデル | ドメインサービス | アプリケーションサービス | UI・DB・テスト |
 | クリーン | エンティティ | ユースケース | インターフェースアダプタ | フレームワーク・ドライバ |
+
+表の言葉を整理します。
+
+- **ドメインモデル/エンティティ**: L6〜L9 で見たエンティティ・値オブジェクト・集約。クリーンアーキテクチャの「エンティティ」は、DDD のエンティティより広く「業務ルールを持つオブジェクト全般」を指します
+- **アプリケーションサービス/ユースケース**: L12 で見た、「注文する」のような利用者の操作1つ分の処理の流れ
+- **インターフェースアダプタ**: ch01 のアダプタとほぼ同じ。HTTP の入力をユースケースの引数に変える**コントローラ**、結果を画面向けの形に整える**プレゼンター**、DB とのやり取りを包む**ゲートウェイ**(リポジトリの実装)など
+- **フレームワーク・ドライバ**: Web フレームワーク(gin など、Web アプリを作るための部品一式)や DB ドライバ(DB と通信するライブラリ)
 
 名前も円の枚数も違いますが、**本質は 3 つとも同じ**です。
 
@@ -131,9 +311,22 @@ Go の慣例「interface は使う側で定義する」は DIP そのもので�
 2. **依存は常に内向き** — 内側は外側を import しない
 3. **外界は交換可能** — DB・フレームワーク・UI は「詳細」であり、アダプタ(境界の interface)越しに差し替えられる
 
+ここでいう**詳細**とは「ビジネスルールの正しさに関係しない、取り替えのきく技術の選択」のことです。ECサイトなら次のとおりです。
+
+| 円 | ECサイトでの例 |
+|---|---|
+| 中心 | `Order`、`Money`、「確定後は明細を変えられない」というルール |
+| ユースケース | `PlaceOrder`(注文する) |
+| アダプタ | 注文 API の HTTP ハンドラ、`OrderRepository` の PostgreSQL 実装 |
+| 最外殻(詳細) | gin、PostgreSQL そのもの |
+
+たとえばユースケースが `gin.Context`(gin がリクエストごとに渡してくる値)を引数に取ると、内側が最外殻の gin を import することになり、「依存は内向き」が破れます。
+
 ### 最大の実利: テスタビリティ
 
-依存が内向きなら、ドメインとユースケースは **DB もフレームワークもなしで単体テスト**できます。
+**テスタビリティ**はテストのしやすさです。依存が内向きなら、ドメインとユースケースは **DB もフレームワークもなしで単体テスト**(関数やメソッドを1つずつ確かめる自動テスト。L8 で見た `testing`)できます。
+
+本物の DB の代わりに、テスト用の簡易な実装を渡します。これを**フェイク (fake)** と呼び、外から部品を渡すことを**注入**と呼びます。
 
 ```go
 // リポジトリのフェイクを注入してユースケースをテスト
@@ -142,7 +335,113 @@ uc := usecase.NewPlaceOrder(repo)
 err := uc.Execute(ctx, cmd)         // DB 不要・ミリ秒で完走
 ```
 
-テストが速いとリファクタリングが怖くなくなり、モデルを深める(第1章の知識の噛み砕き)サイクルが回り続けます。
+| 行 | 意味 |
+|---|---|
+| `repo := &fakeOrderRepo{}` | フェイクを作る。`&` で作った値へのポインタを得る |
+| `uc := usecase.NewPlaceOrder(repo)` | ユースケースを作り、フェイクを渡す(注入)。ユースケースは interface しか知らないので本物かフェイクかを区別しない |
+| `err := uc.Execute(ctx, cmd)` | ユースケースを実行する。`cmd` は「注文の中身」をまとめた入力の値 |
+
+### 動かして確かめる
+
+ユースケースとテストを、そのまま `go test` で動く形にしたものです。まずユースケース側(`usecase.go`)です。
+
+```go
+package placeorder
+
+import "errors"
+
+type Order struct {
+	ID       string
+	Quantity int
+}
+
+// ポート: 保存の能力だけを宣言する
+type OrderRepository interface {
+	Save(o *Order) error
+}
+
+// ユースケース: 中に OrderRepository(interface)を持つ
+type PlaceOrder struct {
+	repo OrderRepository
+}
+
+func NewPlaceOrder(repo OrderRepository) *PlaceOrder {
+	return &PlaceOrder{repo: repo}
+}
+
+func (uc *PlaceOrder) Execute(id string, qty int) error {
+	if qty < 1 {
+		return errors.New("数量は1以上にしてください")
+	}
+	return uc.repo.Save(&Order{ID: id, Quantity: qty})
+}
+```
+
+テスト側(`usecase_test.go`)です。Go ではファイル名が `_test.go` で終わるファイルにテストを書き、`func TestXxx(t *testing.T)` の形の関数が1つのテストになります。
+
+```go
+package placeorder
+
+import "testing"
+
+// フェイク: DB の代わりに map に入れるだけの実装
+type fakeOrderRepo struct {
+	saved map[string]*Order
+}
+
+func (f *fakeOrderRepo) Save(o *Order) error {
+	f.saved[o.ID] = o
+	return nil
+}
+
+func TestExecute_Saves(t *testing.T) {
+	repo := &fakeOrderRepo{saved: map[string]*Order{}}
+	uc := NewPlaceOrder(repo)
+	if err := uc.Execute("o-1", 2); err != nil {
+		t.Fatal(err)
+	}
+	if repo.saved["o-1"].Quantity != 2 {
+		t.Fatal("保存された数量が違う")
+	}
+}
+
+func TestExecute_RejectsZero(t *testing.T) {
+	repo := &fakeOrderRepo{saved: map[string]*Order{}}
+	uc := NewPlaceOrder(repo)
+	if err := uc.Execute("o-2", 0); err == nil {
+		t.Fatal("数量0が通ってしまった")
+	}
+	if len(repo.saved) != 0 {
+		t.Fatal("保存されてはいけない")
+	}
+}
+```
+
+| 部分 | 意味 |
+|---|---|
+| `type fakeOrderRepo struct { saved map[string]*Order }` | 保存先は DB ではなく map(Python の dict に当たる、キーと値の組の入れ物) |
+| `func (f *fakeOrderRepo) Save(...)` | Save を持つので OrderRepository として渡せる |
+| `map[string]*Order{}` | 空の map を作る |
+| `t.Fatal(...)` | テストを失敗させ、メッセージを表示する |
+| `repo.saved["o-1"].Quantity` | フェイクの中身を直接見て、本当に保存されたかを確かめる |
+| `len(repo.saved) != 0` | 数量0のときは何も保存されていないことを確かめる |
+
+`go test -v` で実行した結果です(`-v` は各テストの結果を1つずつ表示するオプション)。
+
+```text
+=== RUN   TestExecute_Saves
+--- PASS: TestExecute_Saves (0.00s)
+=== RUN   TestExecute_RejectsZero
+--- PASS: TestExecute_RejectsZero (0.00s)
+PASS
+ok  	placeorder	0.006s
+```
+
+`PASS` は合格、`(0.00s)` はかかった秒数です(最後の行の秒数は実行のたびに少し変わります)。DB を起動していないので、一瞬で終わります。
+
+本物の DB でテストする方法もあります(SQLite=ファイル1つで動く軽量な DB、docker compose=DB などのサーバーを1コマンドでまとめて起動する道具)。ただし起動と後片付けに時間がかかるので、ビジネスルールの確認は上のように DB なしで行い、DB の動作確認は少数のテストに分けるのが一般的です。
+
+テストが速いとリファクタリング(外から見た動きを変えずにコードの中身を整理すること)が怖くなくなり、モデルを深める(第1章の知識の噛み砕き)サイクルが回り続けます。
 
 💡 コツ: 「ヘキサゴナル派 vs クリーン派」の論争に実りはありません。チームで合意すべきは図の名前ではなく**「依存は内向き」というルールただ1つ**です。
 
@@ -223,11 +522,26 @@ err := uc.Execute(ctx, cmd)         // DB 不要・ミリ秒で完走
 
 </details>
 
+**問6.** この章の完全版のテスト `TestExecute_RejectsZero` で、`uc.Execute("o-2", 0)` を呼んだ直後の `len(repo.saved)` はいくつになるでしょう?
+
+1. 1。数量0でも注文はいったん保存される
+2. 実行するたびに変わる
+3. 0。数量チェックで error が返り、Save が呼ばれない
+4. DB に接続できないためテストが実行できない
+
+<details><summary>答えと解説</summary>
+
+正解: **3**
+
+Execute は最初に `if qty < 1` を確認し、0 なら error を返してその場で終わります。`uc.repo.Save(...)` の行まで進まないので、フェイクの map には何も入らず 0 件のままです。保存は数量チェックを通った後にだけ行われます。結果は毎回同じで、フェイクは map を使うだけなので DB への接続もそもそも必要ありません。
+
+</details>
+
 ## 3. 現実のプロジェクト構成 — 小さく始めてやりすぎない
 
 ### Go での構成例
 
-教科書の同心円を、Go では次のようなパッケージ構成に落とすのが定番です。
+教科書の同心円を、Go では次のようなパッケージ構成(フォルダ構成)に落とすのが定番です。
 
 ```text
 internal/
@@ -241,14 +555,61 @@ internal/
 cmd/api/main.go    # 依存の組み立て(DI)と起動
 ```
 
-Python / FastAPI でも考え方は同じです: `app/domain/`(Pydantic に依存しない純粋なクラス)、`app/usecase/`、`app/adapter/`(routers・repositories)。ルーターは薄く、ビジネスルールは domain へ。
+| フォルダ | 意味 |
+|---|---|
+| `internal/` | Go が特別扱いするフォルダ名。この中のパッケージは、同じプロジェクトの外からは import できない |
+| `domain/` | 中心の円。外のパッケージを import しない |
+| `usecase/` | ユースケース。domain だけを import する |
+| `adapter/` | 外側。gin や echo(どちらも Go の Web フレームワーク)、DB ライブラリを import してよいのはここだけ |
+| `cmd/api/main.go` | プログラムの入口(`func main` がある場所) |
+
+**DI (Dependency Injection、依存性の注入)** は、部品を使う側の中で作らず、外で作って渡すことです。main.go で部品を内側から順に組み立てて渡すのが定番です。形だけを示すと次のとおりです(本物の DB が必要なので、このままでは動きません)。
+
+```go
+func main() {
+    db := openDB()                     // 外界: DB に接続する
+    repo := postgres.NewOrderRepo(db)  // セカンダリアダプタを作る
+    uc := usecase.NewPlaceOrder(repo)  // ユースケースにポートとして渡す
+    h := handler.NewOrderHandler(uc)   // プライマリアダプタに渡す
+    http.ListenAndServe(":8080", h)    // ポート番号 8080 で HTTP を待ち受ける
+}
+```
+
+ch01 の完全版の `main` で `ConfirmOrder(EmailNotifier{}, ...)` と渡していたのと同じことを、部品を増やして行っています。どの実装を使うかを知っているのは main.go だけです。
+
+Python / FastAPI でも考え方は同じです: `app/domain/`(Pydantic=FastAPI でデータの形の定義と検証に使うライブラリ、に依存しない純粋なクラス)、`app/usecase/`、`app/adapter/`(routers=URL ごとの処理を書く場所・repositories)。ルーターは薄く、ビジネスルールは domain へ。
+
+「薄いルーター」の具体例です。割引ルールを FastAPI を import しない関数にしておけば、サーバーを起動せずに呼んで確かめられます。
+
+```python
+# domain 側: FastAPI も DB も import しない、ただの関数
+def apply_discount(total: int, is_member: bool) -> int:
+    if is_member and total >= 5000:  # 会員で5000円以上なら
+        return total - 500           # 500円引き
+    return total
+
+
+print(apply_discount(6000, True))
+print(apply_discount(6000, False))
+print(apply_discount(3000, True))
+```
+
+```text
+5500
+6000
+3000
+```
+
+ルーター側は `total = apply_discount(req.total, req.is_member)` のように、受け取った値を渡して結果を返すだけにします。
+
+L11 で見た ORM の SQLAlchemy(Python で DB のテーブルをクラスとして扱うライブラリ)のモデルクラスも、DB の都合を持つ外側の部品です。ビジネスルールはそこではなく domain に置きます。また、機能ごとに別々のサーバーへ分ける**マイクロサービス**(小さなサービスをネットワーク越しに連携させる構成)は、この章の話とは別の判断です。まず1つのプログラムの中で domain を分けるだけで十分な効果があります。
 
 ### 段階的に適用する
 
 最初から全部やる必要はありません。効果が大きい順に:
 
 1. **domain パッケージを分離**し、ビジネスルールをそこへ寄せる(これだけで価値の 7 割)
-2. リポジトリを interface 化してテストを外界から切る
+2. リポジトリを interface 化してテストを外界から切る(ch02 のフェイクが使えるようになる)
 3. ユースケース層を立ててハンドラを薄くする
 
 ### やりすぎのサイン
@@ -258,8 +619,11 @@ Python / FastAPI でも考え方は同じです: `app/domain/`(Pydantic に依�
 | 1 行の変更に 5 ファイルの修正が必要 | 抽象の層が多すぎる |
 | 実装が 1 つしかない interface が大量にある | 「いつか差し替えるかも」の先回りしすぎ |
 | 新人がどこに何を書くか 1 週間迷う | チームの理解度と乖離 |
+| どの層にも同じ形の受け渡しコードが並ぶ | **ボイラープレート**(中身のない定型コード)が増えすぎている |
 
-💡 コツ: アーキテクチャは**ドメインを守るための手段であって目的ではありません**。守るほどのドメインの複雑さがない画面(単純 CRUD)まで同じ儀式を強いるのはコストです(第16章で詳述)。
+interface を残す価値があるのは、ch02 のようにテストでフェイクに差し替えたい所(リポジトリ・外部サービス)や、実際に実装が複数ある所です。そうでない所は、具体的な型をそのまま使ってかまいません。
+
+💡 コツ: アーキテクチャは**ドメインを守るための手段であって目的ではありません**。守るほどのドメインの複雑さがない画面(単純 CRUD=作成・読み取り・更新・削除だけの処理)まで同じ儀式を強いるのはコストです(第16章で詳述)。
 
 ### 確認問題
 
