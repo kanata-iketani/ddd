@@ -6,12 +6,14 @@
 
 ### アプリケーションサービスとは
 
-アプリケーションサービス (Application Service) は、**ユースケースの進行役**です。「注文する」「会員を退会させる」といったユースケース1つにつき1メソッドを持ち、処理の流れを取り仕切ります。典型的な流れは次の4ステップです。
+**ユースケース**は、利用者がシステムを使って達成したいこと1つ分です。例:「注文を確定する」「会員を退会させる」「パスワードを変更する」。
 
-1. リポジトリから集約を取得する
+アプリケーションサービス (Application Service) は、**ユースケースの進行役**です。ユースケース1つにつき1メソッドを持ち、処理の流れを取り仕切ります。典型的な流れは次の4ステップです。
+
+1. リポジトリ(L11)から集約を取得する
 2. 集約(ドメインオブジェクト)のメソッドを呼ぶ — **ビジネスルールはここに任せる**
 3. リポジトリで保存する
-4. 必要ならドメインイベントを発行する
+4. 必要ならドメインイベント(L10)を発行する
 
 ```go
 type PlaceOrderUseCase struct {
@@ -34,19 +36,173 @@ func (u *PlaceOrderUseCase) Execute(ctx context.Context, cmd PlaceOrderCommand) 
 }
 ```
 
+| 部分 | 意味 |
+|---|---|
+| `orders OrderRepository` | フィールドの型がインターフェース(L11)。本番では DB 版、テストではインメモリ版を入れられる |
+| `events EventPublisher` | イベントを発行する係。これもインターフェース |
+| `ctx context.Context` | 処理の期限や中止の合図を運ぶ Go 標準の引数(L10 ch03) |
+| `cmd PlaceOrderCommand` | ユースケースへの入力をまとめた構造体。「注文を確定してください」というコマンド(L10 ch03)にあたる |
+| `order, err := u.orders.Find(...)` | 1. 集約を取得する。見つからなければエラーを返して終わる |
+| `order.Place(cmd.PaymentMethod)` | 2. 確定してよいかの判断は集約に任せる |
+| `u.orders.Save(ctx, order)` | 3. 保存する |
+| `u.events.Publish(ctx, order.PullEvents()...)` | 4. 溜まったイベント(L10 ch02)を発行する。`...` は「スライスの中身をばらして、1つずつ引数として渡す」という意味 |
+
+`Publish` の引数が `events ...OrderPlaced` のように `...` 付きで定義されていると、いくつでも引数を受け取れます(可変長引数)。そこへスライスを渡すときに、呼ぶ側でも `...` を付けます。
+
+### 動かして確かめる
+
+DB の代わりにインメモリのリポジトリ、イベント発行の代わりに画面表示をする簡易実装を入れた完全版です。
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+)
+
+// ---- ドメイン層 ----
+type OrderID string
+
+type OrderPlaced struct{ OrderID OrderID }
+
+type Order struct {
+	id     OrderID
+	status string
+	events []OrderPlaced
+}
+
+var ErrAlreadyPlaced = errors.New("この注文はすでに確定しています")
+
+// ビジネスルールは集約が判断する
+func (o *Order) Place(paymentMethod string) error {
+	if o.status == "確定" {
+		return ErrAlreadyPlaced
+	}
+	o.status = "確定"
+	o.events = append(o.events, OrderPlaced{OrderID: o.id})
+	return nil
+}
+
+func (o *Order) PullEvents() []OrderPlaced {
+	evs := o.events
+	o.events = nil
+	return evs
+}
+
+type OrderRepository interface {
+	Find(ctx context.Context, id OrderID) (*Order, error)
+	Save(ctx context.Context, o *Order) error
+}
+
+// ---- アプリケーション層 ----
+type EventPublisher interface {
+	Publish(ctx context.Context, events ...OrderPlaced) error
+}
+
+// ユースケースへの入力(コマンド)
+type PlaceOrderCommand struct {
+	OrderID       OrderID
+	PaymentMethod string
+}
+
+type PlaceOrderUseCase struct {
+	orders OrderRepository
+	events EventPublisher
+}
+
+func (u *PlaceOrderUseCase) Execute(ctx context.Context, cmd PlaceOrderCommand) error {
+	order, err := u.orders.Find(ctx, cmd.OrderID)
+	if err != nil {
+		return err
+	}
+	if err := order.Place(cmd.PaymentMethod); err != nil { // ルールは集約が判断
+		return err
+	}
+	if err := u.orders.Save(ctx, order); err != nil {
+		return err
+	}
+	return u.events.Publish(ctx, order.PullEvents()...)
+}
+
+// ---- インフラ層(ここではテスト用の簡易実装) ----
+type memRepo struct{ data map[OrderID]*Order }
+
+func (r *memRepo) Find(ctx context.Context, id OrderID) (*Order, error) {
+	o, ok := r.data[id]
+	if !ok {
+		return nil, errors.New("注文が見つかりません")
+	}
+	return o, nil
+}
+
+func (r *memRepo) Save(ctx context.Context, o *Order) error {
+	r.data[o.id] = o
+	return nil
+}
+
+type printPublisher struct{}
+
+func (printPublisher) Publish(ctx context.Context, events ...OrderPlaced) error {
+	for _, e := range events {
+		fmt.Println("  イベント発行: OrderPlaced", e.OrderID)
+	}
+	return nil
+}
+
+func main() {
+	repo := &memRepo{data: map[OrderID]*Order{"o-001": {id: "o-001", status: "下書き"}}}
+	uc := &PlaceOrderUseCase{orders: repo, events: printPublisher{}}
+	ctx := context.Background()
+	cmd := PlaceOrderCommand{OrderID: "o-001", PaymentMethod: "card"}
+
+	fmt.Println("1回目:")
+	fmt.Println("  結果:", uc.Execute(ctx, cmd))
+	fmt.Println("2回目:")
+	fmt.Println("  結果:", uc.Execute(ctx, cmd))
+	fmt.Println("存在しない注文:")
+	fmt.Println("  結果:", uc.Execute(ctx, PlaceOrderCommand{OrderID: "o-999"}))
+}
+```
+
+実行結果:
+
+```text
+1回目:
+  イベント発行: OrderPlaced o-001
+  結果: <nil>
+2回目:
+  結果: この注文はすでに確定しています
+存在しない注文:
+  結果: 注文が見つかりません
+```
+
+| 呼び出し | 何が起きたか |
+|---|---|
+| 1回目 | 取得 → 確定 → 保存 → イベント発行まで進み、結果はエラーなし(`<nil>`) |
+| 2回目 | 注文集約の Place が「すでに確定しています」と判断し、保存もイベント発行もせずにエラーを返した |
+| 存在しない注文 | 最初の Find で失敗したので、その先には進まない |
+
+2回目のエラーを判断したのは、ユースケースの if 文ではなく注文集約の `Place` メソッドです。アプリケーションサービスは順番に呼んで、エラーが返ったらそこで止めているだけです。
+
+なお、このコードでは簡単のためトランザクションの開始とコミットを省いています。実際には Find から Save までを1つのトランザクションで囲みます。また、保存とイベント発行を確実にそろえたい場合は、L10 ch03 のアウトボックスパターンを使います。
+
 ### 薄く保つ (keep it thin)
 
-アプリケーションサービスに `if order.Total > 10000 { 割引... }` のような**ビジネスルールを書き始めたら、それはドメイン層へ移すサイン**です。ルールがユースケースごとに重複し、ドメインモデルが貧血化していきます。アプリケーションサービスは「進行表の読み上げ係」であって、判断はしません。
+アプリケーションサービスに `if order.Total > 10000 { 割引... }` のような**ビジネスルールを書き始めたら、それはドメイン層へ移すサイン**です。ルールがユースケースごとに重複し、ドメインモデルが貧血化(ルールを持たないデータの袋になること。L10 ch01)していきます。アプリケーションサービスは「進行表の読み上げ係」であって、判断はしません。コードが長くなったときに、private 関数(同じパッケージの中からだけ呼べる関数。Go では小文字で始まる関数)に分けて行数を減らしても、ルールの置き場所が間違っている問題は解決しません。
 
 一方で**トランザクションの開始とコミットはアプリケーションサービスの仕事**です。「どこからどこまでを1つの作業とするか」はユースケースの関心事だからです。
 
 ### ドメインサービスとの違い
 
-| | アプリケーションサービス | ドメインサービス |
+| | アプリケーションサービス | ドメインサービス(L10 ch01) |
 |---|---|---|
 | 関心 | 業務の進行(ユースケース) | ドメインの知識・計算 |
 | 層 | アプリケーション層 | ドメイン層 |
 | 例 | 注文確定の一連の流れ | 送料の算定ルール |
+
+アプリケーション層・ドメイン層といった「層」については、次のチャプター(ch02)で扱います。HTTP リクエストの JSON(L4)を読み取って形式を検査するのは、さらに外側のプレゼンテーション層の仕事です(ch02・ch03)。
 
 💡 コツ: アプリケーションサービスのメソッドを読んだとき、**業務マニュアルの目次のように読める**のが理想です。詳細が読めてしまったら書きすぎです。
 
@@ -127,11 +283,30 @@ func (u *PlaceOrderUseCase) Execute(ctx context.Context, cmd PlaceOrderCommand) 
 
 </details>
 
+**問6.** 本文の完全版で、同じ注文に対して2回目の Execute を呼ぶと「この注文はすでに確定しています」というエラーが返りました。このエラーを判断したのはどこでしょう？
+
+1. アプリケーションサービス(PlaceOrderUseCase)の中の if 文
+2. リポジトリの Save メソッド
+3. イベントを発行する EventPublisher
+4. 注文集約の Place メソッド(ドメイン層)
+
+<details><summary>答えと解説</summary>
+
+正解: **4**
+
+「確定済みの注文は再び確定できない」はビジネスルールなので、注文集約の Place メソッドが判断してエラーを返しています。アプリケーションサービスは Place を呼び、エラーが返ったらそれをそのまま返して処理を止めているだけです。リポジトリは出し入れの係、EventPublisher はイベントを配る係で、業務の判断はしません。Place がエラーを返した時点で処理が止まるので、2回目は保存もイベント発行も行われていません。
+
+</details>
+
 ## 2. レイヤードアーキテクチャ — 依存はドメインに向ける
+
+### レイヤー(層)とは
+
+**レイヤードアーキテクチャ (Layered Architecture)** は、プログラムを役割ごとの**層(レイヤー)**に分け、層ごとにフォルダ(Go ならパッケージ)を分ける構成です。「HTTP の処理」「業務ルール」「DB の処理」が1つのファイルに混ざらないようにするのが目的です。
 
 ### 4つの層と責務
 
-DDDの文脈でよく使われるレイヤードアーキテクチャ (Layered Architecture) は、次の4層です。
+DDDの文脈でよく使われるのは、次の4層です。
 
 | 層 | 責務 | 置くもの |
 |---|---|---|
@@ -140,11 +315,30 @@ DDDの文脈でよく使われるレイヤードアーキテクチャ (Layered A
 | ドメイン | ビジネスルールとモデル | エンティティ、値オブジェクト、集約、**リポジトリのインターフェース** |
 | インフラストラクチャ | 技術詳細 | リポジトリの実装、DB、外部API、メール送信 |
 
+| 用語 | 意味 |
+|---|---|
+| CLI | コマンドライン(黒い画面に文字を打つ操作)からプログラムを動かす入口 |
+| ハンドラ | HTTP リクエストを最初に受け取って処理する関数 |
+| DTO | 外部とやりとりするためのデータの形(ch03) |
+| 形式チェック | 必須項目があるか、数値か、など入力の形の検査(ch03) |
+
+「注文を確定する」リクエストが来たときの流れを、層で追うと次のようになります。
+
+| 順番 | 層 | すること |
+|---|---|---|
+| 1 | プレゼンテーション | HTTP リクエストの JSON を読み、形式を検査し、コマンドを作る |
+| 2 | アプリケーション | ch01 の PlaceOrderUseCase がユースケースを進める |
+| 3 | ドメイン | 注文集約の Place が「確定してよいか」を判断する |
+| 4 | インフラストラクチャ | リポジトリの実装が SQL で DB に保存する |
+| 5 | プレゼンテーション | 結果を HTTP レスポンスの JSON にして返す |
+
 ### 依存の方向 — ドメインを守る
+
+「A が B に**依存する**」とは、A のコードが B を import して(読み込んで)使っていることです。B が変わると、A も直す必要が出るかもしれません。
 
 鉄則は「**依存は内側(ドメイン)に向ける**」です。ドメイン層は他のどの層にも依存しません。フレームワークも、DBも、HTTPも知りません。だからこそビジネスルールを単体でテストでき、技術の変更(DB移行、フレームワーク更新)に巻き込まれません。
 
-「ドメイン層がリポジトリを使うのに、実装はインフラ層にある」を成立させるのが**依存性逆転 (Dependency Inversion)** です。インターフェースをドメイン層に置き、実装をインフラ層に置きます。
+「ドメイン層がリポジトリを使うのに、実装はインフラ層にある」を成立させるのが**依存性逆転 (Dependency Inversion)** です(L11 で見ました。詳しくは L13)。インターフェースをドメイン層に置き、実装をインフラ層に置きます。
 
 ```text
 myapp/
@@ -154,13 +348,26 @@ myapp/
 └── presentation/    # handler.go, dto.go
 ```
 
+この構成で、各ファイルが何を import するかを表にすると、矢印がすべてドメインに向かっていることが分かります。
+
+| ファイル | import するもの | 向き |
+|---|---|---|
+| presentation/handler.go | application、`net/http` | アプリケーション層へ |
+| application/place_order_usecase.go | domain | ドメイン層へ |
+| infrastructure/order_repository_pg.go | domain、`database/sql` | ドメイン層へ(ドメインのインターフェースを実装する) |
+| domain/order.go | Go 標準の `errors` や `time` 程度 | どこにも向かない |
+
+`net/http` は Go 標準の HTTP 用パッケージ、`database/sql` は Go 標準の DB 接続用パッケージです。インフラ層はドメインを import しますが、ドメインはインフラを import しません。DB を PostgreSQL から別の製品に替えても、直すのは infrastructure/ だけで済みます。
+
 ### 層をスキップする誘惑
 
 「ハンドラから直接リポジトリを呼べば速いのでは」という誘惑は定番の落とし穴です。一見ムダに見える経由にも意味があります。
 
 - ユースケースの進行(トランザクション、イベント発行)が入口ごとに重複する
 - 集約のメソッドを通らない更新が生まれ、**不変条件が迂回される**
-- テストで差し替える継ぎ目がなくなる
+- テストで差し替える継ぎ目(本物と偽物を入れ替えられる場所。L11 のインターフェースがそれ)がなくなる
+
+たとえばハンドラが「注文の状態を確定に書き換えて保存」を直接行うと、「明細のない注文は確定できない」という Place メソッドのルールを通らずに保存されてしまいます。
 
 💡 コツ: 迷ったら「この import はドメインに向かっているか？」と自問してください。ドメイン層のファイルに `database/sql` や `net/http` の import が現れたら黄信号です。
 
@@ -241,11 +448,26 @@ myapp/
 
 </details>
 
+**問6.** 本文のフォルダ構成で、infrastructure/order_repository_pg.go(PostgreSQL 版のリポジトリ実装)が import してよい組み合わせはどれでしょう？
+
+1. presentation と application(呼び出し元を知るため)
+2. 何も import してはいけない
+3. domain と database/sql(ドメインのインターフェースを実装し、DB に接続するため)
+4. application だけ(ユースケースに合わせて保存するため)
+
+<details><summary>答えと解説</summary>
+
+正解: **3**
+
+インフラ層のリポジトリ実装は、ドメイン層が定めた OrderRepository インターフェースと Order 型を使うので domain を import し、DB に接続するために database/sql を import します。依存の矢印はドメインに向かっているので問題ありません。呼び出し元の presentation や application を import すると、依存がドメイン以外へ向かってしまいます。何も import しないと、実装すべきインターフェースも保存すべき Order 型も使えません。
+
+</details>
+
 ## 3. 境界でのデータ変換とバリデーション
 
 ### DTOとドメインオブジェクトを分ける
 
-APIのリクエスト/レスポンスの形(DTO: Data Transfer Object)と、ドメインオブジェクトは**別物として定義**します。ドメインの構造体に `json:"..."` タグを付けてそのまま返したくなりますが、こうするとAPIの表示都合(キー名、日付フォーマット)がドメインを汚し、逆にドメインの内部変更がそのままAPI互換性を壊します。
+**DTO (Data Transfer Object)** は、外部とデータをやりとりするためだけの形です。API(プログラムどうしの窓口。L4)のリクエスト/レスポンスの形が DTO にあたります。DTO とドメインオブジェクトは**別物として定義**します。ドメインの構造体に `json:"..."` タグ(L4)を付けてそのまま返したくなりますが、こうするとAPIの表示都合(キー名、日付フォーマット)がドメインを汚し、逆にドメインの内部変更がそのままAPI互換性(API を使っている側のプログラムが、変更後もそのまま動き続けること)を壊します。
 
 ```go
 // presentation/dto.go — 境界の形
@@ -259,11 +481,95 @@ func toOrderResponse(o *domain.Order) OrderResponse {
 }
 ```
 
-FastAPI なら Pydantic モデルがこの DTO にあたります。変換関数は境界(プレゼンテーション層)に置きます。
+| 部分 | 意味 |
+|---|---|
+| `ID string` + `json:"id"` | JSON にするときのキー名を `id` にする。フィールドは大文字始まり(公開)でないと JSON に出力されない |
+| `Total int64` + `json:"total_yen"` | Go の名前は Total でも、API のキー名は `total_yen` にできる |
+| `toOrderResponse(o *domain.Order)` | ドメインの注文を DTO に変換する関数。`domain.Order` は domain パッケージの Order 型 |
+| `o.ID().String()` | 注文の ID(独自型 OrderID)を取り出し、文字列に変換する(`String` は OrderID に用意したメソッド) |
+| `o.Total().Yen()` | 合計金額(値オブジェクト Money)を取り出し、円の数値に変換する |
+
+### 動かして確かめる
+
+DTO への変換と、後半で説明する「エラー → HTTP ステータスの変換」をまとめた完全版です(簡単のため、ID と金額は素の型にしています)。
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+)
+
+// ---- ドメイン層: json タグも http も知らない ----
+type Order struct {
+	id       string
+	totalYen int64
+}
+
+func (o *Order) ID() string      { return o.id }
+func (o *Order) TotalYen() int64 { return o.totalYen }
+
+var ErrAlreadyCancelled = errors.New("すでにキャンセル済みです")
+
+// ---- プレゼンテーション層: 境界の形(DTO)と変換 ----
+type OrderResponse struct {
+	ID    string `json:"id"`
+	Total int64  `json:"total_yen"`
+}
+
+func toOrderResponse(o *Order) OrderResponse {
+	return OrderResponse{ID: o.ID(), Total: o.TotalYen()}
+}
+
+// ドメインのエラー → HTTP ステータスへの翻訳
+func statusCodeFor(err error) int {
+	switch {
+	case err == nil:
+		return http.StatusOK // 200
+	case errors.Is(err, ErrAlreadyCancelled):
+		return http.StatusConflict // 409
+	default:
+		return http.StatusInternalServerError // 500
+	}
+}
+
+func main() {
+	o := &Order{id: "o-001", totalYen: 3000}
+	body, _ := json.Marshal(toOrderResponse(o))
+	fmt.Println(string(body))
+
+	fmt.Println(statusCodeFor(nil))
+	fmt.Println(statusCodeFor(ErrAlreadyCancelled))
+	fmt.Println(statusCodeFor(errors.New("DB に接続できません")))
+}
+```
+
+実行結果:
+
+```text
+{"id":"o-001","total_yen":3000}
+200
+409
+500
+```
+
+| 出力 | 意味 |
+|---|---|
+| `{"id":"o-001","total_yen":3000}` | `json.Marshal` で DTO を JSON に変換した結果。キー名は json タグのとおり。ドメインの `Order` には json タグがない |
+| `200` | エラーなし → 成功 |
+| `409` | ドメインの「キャンセル済み」エラー → 409 Conflict |
+| `500` | 想定外のエラー → 500 Internal Server Error |
+
+`json.Marshal` は Go の値を JSON の文字列(のバイト列)に変換する標準の関数で、`string(body)` で表示できる文字列にしています。`switch { case ...: }` は、上から順に条件を調べて最初に当てはまったものを実行する書き方です。`errors.Is(err, ErrAlreadyCancelled)` は「err が ErrAlreadyCancelled であるか」を調べます。
+
+FastAPI なら Pydantic(リクエストやレスポンスの形をクラスで定義し、自動で検査するライブラリ)のモデルがこの DTO にあたります。変換関数は境界(プレゼンテーション層)に置きます。
 
 ### バリデーションの3段階
 
-「どこで検証するか」は混乱しやすいので、3段階に整理します。
+バリデーションは「入力が正しいかを検査すること」です。「どこで検証するか」は混乱しやすいので、3段階に整理します。
 
 | 段階 | 例 | 置き場所 |
 |---|---|---|
@@ -271,11 +577,30 @@ FastAPI なら Pydantic モデルがこの DTO にあたります。変換関数
 | ドメインルール | 注文数は1〜100、メールアドレスの仕様 | ドメイン層(値オブジェクト・エンティティ) |
 | ユースケース固有の前提 | 対象の会員が存在するか(他集約の照会が必要) | アプリケーション層 |
 
-重要なのは、**ドメイン層が最終防衛線**だということです。「Pydanticでチェック済みだからドメインでは省略」は危険です。入口はHTTPだけとは限らず(バッチ、管理CLI、別API)、どの経路から来ても値オブジェクトの生成時検証がルールを守ります。
+同じ入力 `{"quantity": "abc"}`、`{"quantity": 0}` で考えると、前者は数値でないので形式チェックで弾かれ、後者は数値としては正しいが「1〜100」に反するのでドメインルールで弾かれます。
+
+重要なのは、**ドメイン層が最終防衛線**だということです。「Pydanticでチェック済みだからドメインでは省略」は危険です。入口はHTTPだけとは限らず(バッチ=まとめて一括処理するプログラム、管理CLI、別API)、どの経路から来ても値オブジェクト(L7)の生成時検証がルールを守ります。
 
 ### エラーの変換
 
-ドメイン層は `ErrAlreadyCancelled` のような**ドメインの言葉のエラー**を返します。それをHTTPステータス(409など)へ変換するのはプレゼンテーション層の仕事です。ドメインが `http.StatusConflict` を知っていたら依存の向きが壊れています。
+ドメイン層は `ErrAlreadyCancelled` のような**ドメインの言葉のエラー**を返します。それをHTTPステータス(409など)へ変換するのはプレゼンテーション層の仕事です。ドメインが `http.StatusConflict` を知っていたら依存の向きが壊れています(ch02)。
+
+HTTP ステータスは、HTTP レスポンスに付ける「結果の種類」を表す3桁の番号です。
+
+| 番号 | 名前 | 使う場面の例 |
+|---|---|---|
+| 200 | OK | 成功 |
+| 400 | Bad Request | 入力の形式が正しくない |
+| 404 | Not Found | 指定された注文がない |
+| 409 | Conflict | いまの状態と衝突する操作(キャンセル済みの注文をまたキャンセルする等) |
+| 500 | Internal Server Error | サーバー側の想定外のエラー |
+
+### この章の問題に出てくる用語
+
+| 用語 | 意味 |
+|---|---|
+| CHECK 制約 | 列の値に条件(例: 1以上)を付け、条件に反する行を DB が拒む機能 |
+| 外部キー制約 | 他のテーブルに存在する値しか入れられないようにする DB の機能 |
 
 💡 コツ: 「この検証は、入口が増えても必ず守られるべきか？」— Yes ならドメイン層に置く(または重ねて置く)のが安全です。
 
@@ -353,5 +678,20 @@ FastAPI なら Pydantic モデルがこの DTO にあたります。変換関数
 正解: **3**
 
 HTTPステータスは「Webという入口」の言葉なので、翻訳はプレゼンテーション層の責務です。ドメイン層が409を知ると net/http への依存が生まれ、依存の向きが壊れます。アプリケーションサービスに置くと、同じユースケースをCLIから呼んだときにHTTPの概念が紛れ込みます。リポジトリはデータアクセスの実装であり、エラー翻訳の場所ではありません。「各層は自分の言葉でエラーを語り、境界で翻訳する」と覚えましょう。
+
+</details>
+
+**問6.** 本文の OrderResponse に `OrderResponse{ID: "o-001", Total: 3000}` を入れて `json.Marshal` しました。出力として正しいものはどれでしょう？
+
+1. {"ID":"o-001","Total":3000}
+2. {"id":"o-001","total_yen":3000}
+3. {"id":"o-001","total":3000}
+4. {}(フィールドが出力されない)
+
+<details><summary>答えと解説</summary>
+
+正解: **2**
+
+json タグを付けたフィールドは、タグに書いた名前がキーになります。ID は `json:"id"` なので id、Total は `json:"total_yen"` なので total_yen です。タグがなければ Go のフィールド名(ID, Total)がそのままキーになりますが、ここではタグがあります。フィールドが大文字で始まる公開フィールドなので、空の {} にはなりません。このように API のキー名を DTO 側で決めておけば、ドメインの名前とは独立に API の形を保てます。
 
 </details>
